@@ -13,25 +13,22 @@ import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
 import java.io.BufferedReader;
+
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.StringReader;
 import java.net.HttpURLConnection;
-import java.net.MalformedURLException;
 import java.net.URL;
-import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.Base64;
-import java.util.HashMap;
 import java.util.Locale;
-import java.util.Map;
 
 /**
  * The AWSIdentitySTSNegotiator class handles the SASL negotiation process for AWS Identity authentication.
  * <p>
  * This negotiator expects the client to provide a pre-signed URL to invoke the GetCallerIdentity API on the AWS
- * Secure Token Service (STS). GetCallerIdentity validates the signature and returns the ARN identifying the principal
+ * Secure Token Service (STS). GetCallerIdentity validates the signature and returns an ARN identifying the principal
  * that signed the request. Note that invoking GetCallerIdentity doesn't require any permissions grants (in fact, it
  * isn't possible to deny an IAM principal access to the API!). If the client's signature is invalid, or the client
  * provides an invalid URL, this negotiator will reject their authentication attempt.
@@ -43,17 +40,21 @@ import java.util.Map;
  */
 class AWSIdentitySTSNegotiator implements IAuthenticator.SaslNegotiator {
 
+    /** Magic bytes that we expect to the client to prefix its auth challenge response. */
+    private static final byte[] STSBYTES = "AWSSTS".getBytes(StandardCharsets.UTF_8);
+
+    /** Returned by evaluateResponse() to indicate the client has successfully authenticated. */
+    private static final byte[] EMPTY_BYTE_ARRAY = new byte[0];
+
     /** For nonce generation. */
     private static final SecureRandom RND = new SecureRandom();
 
     private static final int NONCE_LENGTH_BYTES = 16;
 
+    /** Random nonce for this authentication attempt. */
     private byte[] nonce = null;
 
-    /** Magic bytes that we expect to the client to prefix its auth challenge response. */
-    private static final byte[] STSBYTES = "AWSSTS".getBytes(StandardCharsets.UTF_8);
-
-    private static final byte[] EMPTY_BYTE_ARRAY = new byte[0];
+    private static final String NONCE_KEY = "nonce=";
 
     /** Indicates if the client has successfully completed authentication handshake. */
     private boolean complete = false;
@@ -72,27 +73,32 @@ class AWSIdentitySTSNegotiator implements IAuthenticator.SaslNegotiator {
      * URL, signed by the IAM principal that the client wishes to authenticate as.
      *
      * @param clientResponse The non-null (but possibly empty) response sent by the client
-     * @return An encoded nonce to be included in this node's AUTH_CHALLENGE to the client, or an empty byte array
-     *         if the client has successfully authenticated.
-     * @throws AuthenticationException
+     * @return A Base-64 encoded nonce to be included in this node's AUTH_CHALLENGE to the client, or an empty byte
+     *         array if the client has successfully authenticated.
+     * @throws AuthenticationException If the client has provided an invalid GetCallerIdentity request, or if STS
+     *         fails to return an authenticated principal identity.
      */
     @Override
     public byte[] evaluateResponse(byte[] clientResponse) throws AuthenticationException {
         if (Bytes.indexOf(clientResponse, STSBYTES) == 0) {
             if (nonce == null) {
-                nonce = newNonce(NONCE_LENGTH_BYTES);
+                byte[] newNonce = newNonce(NONCE_LENGTH_BYTES);
+                nonce = Base64.getEncoder().encode(newNonce);
             }
-            return ("nonce=" + new String(Base64.getEncoder().encode(nonce))).getBytes(StandardCharsets.UTF_8);
+            // TODO - I think this should include the length of the encoded nonce: will client
+            // handling more future-proof and also enable the client to easily detect a truncated
+            // nonce.
+            return (NONCE_KEY + new String(nonce)).getBytes(StandardCharsets.UTF_8);
         }
 
         String callerIdentityRequest = decodeClientResponse(clientResponse);
-        URL url = validateSTSRequest(callerIdentityRequest);
+        URL url = AWSIdentitySTSRequestValidator.validate(callerIdentityRequest, nonce);
         String stsResponse = invokeSTSRequest(url);
 
         // AWS is a little inconsistent regarding case sensitivity. Usernames are considered case-insensitive,
         // but may appear in mixed case in the ARN. Roles names are considered case-sensitive. For now, to
         // conform to Cassandra's convention of lower-casing "bare" user/role names for case-insensitivity, we
-        // force the ARN to lowe-case as well.
+        // force the ARN to lower-case as well.
         // TODO - This may be the incorrect approach, particularly for IAM role principals.
         userName = parseSTSResponse(stsResponse).toLowerCase(Locale.ROOT);
         complete = true;
@@ -144,87 +150,6 @@ class AWSIdentitySTSNegotiator implements IAuthenticator.SaslNegotiator {
 
         return new String(clientResponse, StandardCharsets.UTF_8);
 
-    }
-
-    /**
-     * Validates the client-provided presigned STS URL. The "action", version, endpoint and SIGV4 parameters are
-     * validated to discourage attempts to invoke non-AWS endpoints, incorrect APIs, etc.
-     * <p>
-     * {@see https://blog.xargs.io/post/2023-07-01-use-presigned-aws-sts-get-caller-identity-for-authentication/}
-     * <p>
-     * The expected form of a valid signed URL is:
-     * {@code https://sts.amazonaws.com/?Action=GetCallerIdentity
-     *            &Version=2011-06-15
-     *            &X-Amz-Algorithm=AWS4-HMAC-SHA256
-     *            &X-Amz-Credential=<YOUR_ACCESS_KEY_ID>/<date>/<region>/sts/aws4_request
-     *            &X-Amz-Date=<timestamp>
-     *            &X-Amz-Expires=<expiration_in_seconds>
-     *            &X-Amz-SignedHeaders=host
-     *            &X-Amz-Signature=<calculated_signature>
-     * }
-     * @param callerIdentityRequest A pre-signed STS GetCallerIdentity URL provided by a client.
-     * @return The URL, if valid.
-     * @throws AuthenticationException if the client-provided URL is malformed or otherwise invalid.
-     */
-    private URL validateSTSRequest(String callerIdentityRequest) {
-        URL url;
-
-        try {
-            url = new URL(callerIdentityRequest);
-        } catch (MalformedURLException e) {
-            throw new AuthenticationException("Invalid URL format");
-        }
-
-        // TODO - Validate the endpoint
-        //throw new AuthenticationException("Invalid STS endpoint");
-
-        // Parse query and validate the query parameters.
-        Map<String, String> queryParams = parseQueryString(url.getQuery());
-
-        if (!"GetCallerIdentity".equals(queryParams.get("Action"))) {
-            throw new AuthenticationException("Invalid action in STS request");
-        }
-
-        if (!"2011-06-15".equals(queryParams.get("Version"))) {
-            throw new AuthenticationException("Invalid API version");
-        }
-
-        String[] requiredParams = {"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-SignedHeaders", "X-Amz-Signature"};
-
-        for (String param : requiredParams) {
-            if (!queryParams.containsKey(param)) {
-                throw new AuthenticationException("Missing required parameter: " + param);
-            }
-        }
-
-        // Validate the expiration time
-        long expiresIn = Long.parseLong(queryParams.getOrDefault("X-Amz-Expires", "0"));
-        if (expiresIn <= 0 || expiresIn > 900) { // 15 minutes max
-            throw new AuthenticationException("Invalid expiration time");
-        }
-
-        return url;
-    }
-
-    /**
-     * Extracts and returns the query parameters from the provided URL.
-     * @param query An HTTP URL.
-     * @return A map of query parameter names and values.
-     */
-    private Map<String, String> parseQueryString(String query) {
-        Map<String, String> queryParams = new HashMap<>();
-
-        if (query != null) {
-            for (String param : query.split("&")) {
-                String[] pair = param.split("=");
-                if (pair.length == 2) {
-                    queryParams.put(URLDecoder.decode(pair[0], StandardCharsets.UTF_8),
-                            URLDecoder.decode(pair[1], StandardCharsets.UTF_8));
-                }
-            }
-        }
-
-        return queryParams;
     }
 
     /**

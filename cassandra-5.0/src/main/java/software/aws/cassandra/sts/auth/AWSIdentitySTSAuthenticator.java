@@ -34,17 +34,14 @@ public class AWSIdentitySTSAuthenticator implements IAuthenticator {
     }
 
     @Override
-    public void validateConfiguration() throws ConfigurationException {
-
-    }
+    public void validateConfiguration() throws ConfigurationException { }
 
     @Override
-    public void setup() {
-
-    }
+    public void setup() { }
 
     @Override
-    public SaslNegotiator newSaslNegotiator(InetAddress clientAddress) {
+    public SaslNegotiator newSaslNegotiator(InetAddress clientAddress)
+    {
         return new AWSIdentitySTSNegotiator();
     }
 
