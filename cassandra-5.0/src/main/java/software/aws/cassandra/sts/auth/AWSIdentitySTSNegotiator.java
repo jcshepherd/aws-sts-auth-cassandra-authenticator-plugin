@@ -1,22 +1,16 @@
 package software.aws.cassandra.sts.auth;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.primitives.Bytes;
 import org.apache.cassandra.auth.AuthenticatedUser;
 import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.exceptions.AuthenticationException;
-import org.w3c.dom.Document;
-import org.xml.sax.InputSource;
-import org.xml.sax.SAXException;
-
-import javax.xml.XMLConstants;
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.parsers.ParserConfigurationException;
-import java.io.BufferedReader;
+import org.apache.cassandra.utils.JsonUtils;
+import org.apache.commons.io.IOUtils;
 
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.StringReader;
+import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -85,7 +79,7 @@ class AWSIdentitySTSNegotiator implements IAuthenticator.SaslNegotiator {
                 byte[] newNonce = newNonce(NONCE_LENGTH_BYTES);
                 nonce = Base64.getEncoder().encode(newNonce);
             }
-            // TODO - I think this should include the length of the encoded nonce: will client
+            // TODO - I think this should include the length of the encoded nonce: will make client
             // handling more future-proof and also enable the client to easily detect a truncated
             // nonce.
             return (NONCE_KEY + new String(nonce)).getBytes(StandardCharsets.UTF_8);
@@ -149,7 +143,6 @@ class AWSIdentitySTSNegotiator implements IAuthenticator.SaslNegotiator {
         }
 
         return new String(clientResponse, StandardCharsets.UTF_8);
-
     }
 
     /**
@@ -159,30 +152,28 @@ class AWSIdentitySTSNegotiator implements IAuthenticator.SaslNegotiator {
      * @throws AuthenticationException if the STS request fails for any reason.
      */
     private String invokeSTSRequest(URL url) throws AuthenticationException {
+        HttpURLConnection conn = null;
         try {
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
+            conn.setRequestProperty("Accept", "application/json");
 
             int responseCode = conn.getResponseCode();
 
             if (responseCode == HttpURLConnection.HTTP_OK) {
-                BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                String inputLine;
-                StringBuilder response = new StringBuilder();
-
-                while ((inputLine = in.readLine()) != null) {
-                    response.append(inputLine);
+                try (InputStream is = conn.getInputStream()) {
+                    return IOUtils.toString(is, StandardCharsets.UTF_8);
                 }
-
-                in.close();
-
-                return response.toString();
             } else {
                 throw new AuthenticationException("STS request failed with response code: " + responseCode);
             }
         } catch (IOException e) {
             // TODO - Should this be retryable?
             throw new AuthenticationException("Error invoking STS request", e);
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
     }
 
@@ -190,20 +181,17 @@ class AWSIdentitySTSNegotiator implements IAuthenticator.SaslNegotiator {
      * Parses the response to the STS GetCallerIdentity request and returns the authenticated IAM principal's ARN.
      */
     private String parseSTSResponse(String stsResponse) {
+        JsonNode root = null;
+
         try {
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            DocumentBuilder builder = factory.newDocumentBuilder();
-            Document doc = builder.parse(new InputSource(new StringReader(stsResponse)));
-
-            String arn = doc.getElementsByTagName("Arn").item(0).getTextContent();
-            String account = doc.getElementsByTagName("Account").item(0).getTextContent();
-            String userId = doc.getElementsByTagName("UserId").item(0).getTextContent();
-
-            // TODO - Any further validation/processing required?
-            return arn;
-        } catch (ParserConfigurationException | SAXException | IOException e) {
-            throw new AuthenticationException("Error parsing STS XML response", e);
+            root = JsonUtils.JSON_OBJECT_MAPPER.readTree(stsResponse);
+        } catch (JsonProcessingException e) {
+            throw new AuthenticationException("Invalid response from STS");
         }
+
+        return root.get("GetCallerIdentityResponse")
+                   .get("GetCallerIdentityResult")
+                   .get("Arn")
+                   .asText();
     }
 }
