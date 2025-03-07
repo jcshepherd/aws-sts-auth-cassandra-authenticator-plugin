@@ -17,7 +17,8 @@ with the signing credentials.
 the client in its authentication response.
 
 Neither the node nor client need to run on AWS infrastructure, and the node itself does not need to be associated with
-any AWS account.
+any AWS account. No particular IAM permissions need to be associated with the AWS account used by the client in order
+to use this authenticator.
 
 # Using the Plugin
 
